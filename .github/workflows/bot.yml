@@ -19,6 +19,7 @@ jobs:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       CHAT_ID: ${{ secrets.CHAT_ID }}
       BOT_MINUTES: "330"
+      REC_MAX_SECONDS: "480"
     steps:
       - uses: actions/checkout@v4
 
@@ -28,9 +29,9 @@ jobs:
 
       - name: Install
         run: |
-          pip install playwright requests
-          playwright install --with-deps chromium webkit
-          sudo apt-get install -y ffmpeg
+          pip install playwright requests pillow
+          playwright install --with-deps chromium
+          sudo apt-get install -y ffmpeg xvfb pulseaudio fonts-noto-color-emoji
 
       - name: Jalankan bot
         run: python bot.py
