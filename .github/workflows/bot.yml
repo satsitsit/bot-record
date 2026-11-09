@@ -1,0 +1,42 @@
+name: bot
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: bot
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+      BOT_MINUTES: "330"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium webkit
+          sudo apt-get install -y ffmpeg
+
+      - name: Jalankan bot
+        run: python bot.py
+
+      - name: Hidupkan lagi otomatis
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml -R "$GITHUB_REPOSITORY"
