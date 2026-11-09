@@ -1,4 +1,5 @@
 import ipaddress
+import json
 import os
 import queue
 import re
@@ -14,15 +15,19 @@ import requests
 TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED = {x.strip() for x in os.environ.get("CHAT_ID", "").split(",") if x.strip()}
 END = time.time() + int(os.environ.get("BOT_MINUTES", "330")) * 60
+MAX_REC = int(os.environ.get("REC_MAX_SECONDS", "480") or 480)  # pengaman, bukan durasi tetap
 API = f"https://api.telegram.org/bot{TOKEN}"
 
-DEFAULT = {"d": "pc", "s": 45, "t": 1}
-DEV_NAME = {"pc": "PC", "iphone": "iPhone (Safari)", "ipad": "iPad (Safari)"}
-DEVICES = [("pc", "💻 PC"), ("iphone", "📱 iPhone"), ("ipad", "📲 iPad")]
-SECS = [30, 45, 60]
+# d = perangkat, a = suara (1/0), t = tap otomatis (1/0), p = kecepatan (f/n/s)
+DEFAULT = {"d": "hp", "a": 1, "t": 1, "p": "n"}
+DEV_NAME = {"pc": "PC", "hp": "HP Android", "iphone": "iPhone", "ipad": "iPad"}
+DEVICES = [("pc", "💻 PC"), ("hp", "📱 HP"), ("iphone", "🍎 iPhone"), ("ipad", "📲 iPad")]
+PACE_NAME = {"f": "cepat", "n": "normal", "s": "pelan"}
+PACES = [("f", "🐇 Cepat"), ("n", "🚶 Normal"), ("s", "🐢 Pelan")]
 
 jobs = queue.Queue()
 state = {"current": None, "last": "belum ada rekaman"}
+RULES = {}  # per chat: {"klik": [...], "hindari": [...], "selesai": "..."} (hilang kalau bot restart)
 
 
 def tg(method, http_timeout=30, **params):
@@ -35,18 +40,35 @@ def tg(method, http_timeout=30, **params):
 
 
 def enc(act, st):
-    return f"{act}|{st['d']}|{st['s']}|{st['t']}"
+    return f"{act}|{st['d']}|{st['a']}|{st['t']}|{st['p']}"
 
 
 def dec(data):
-    p = (data or "").split("|") + ["", "", "", ""]
-    act, d, s, t = p[:4]
+    p = (data or "").split("|") + [""] * 5
+    act, d, a, t, pc = p[:5]
     st = {
         "d": d if d in DEV_NAME else DEFAULT["d"],
-        "s": int(s) if s.isdigit() and int(s) in SECS else DEFAULT["s"],
+        "a": 0 if a == "0" else 1,
         "t": 0 if t == "0" else 1,
+        "p": pc if pc in PACE_NAME else DEFAULT["p"],
     }
     return act, st
+
+
+def rules_of(chat):
+    return RULES.setdefault(str(chat), {"klik": [], "hindari": [], "selesai": ""})
+
+
+def rules_text(chat):
+    r = rules_of(chat)
+    lines = []
+    if r["klik"]:
+        lines.append("Tekan duluan: " + ", ".join(r["klik"]))
+    if r["hindari"]:
+        lines.append("Jangan ditekan: " + ", ".join(r["hindari"]))
+    if r["selesai"]:
+        lines.append("Berhenti saat muncul: " + r["selesai"])
+    return lines
 
 
 def find_url(text):
@@ -72,17 +94,21 @@ def find_url(text):
     return raw
 
 
-def panel_text(url, st):
-    return "\n".join(
-        [
-            "🎬 Panel rekam web",
-            "",
-            f"Link: {url or 'belum ada, kirim link web dulu'}",
-            f"Perangkat: {DEV_NAME[st['d']]}",
-            f"Durasi: {st['s']} detik",
-            f"Tap: {'otomatis' if st['t'] else 'scroll saja'}",
-        ]
-    )
+def panel_text(url, st, chat=None):
+    lines = [
+        "🎬 Panel rekam web",
+        "",
+        f"Link: {url or 'belum ada, kirim link web dulu'}",
+        f"Perangkat: {DEV_NAME[st['d']]}",
+        f"Suara: {'ikut direkam' if st['a'] else 'tanpa suara'}",
+        f"Tap: {'otomatis (deteksi tombol)' if st['t'] else 'scroll saja'}",
+        f"Kecepatan: {PACE_NAME[st['p']]}",
+        "Berhenti: otomatis saat web selesai",
+    ]
+    extra = rules_text(chat) if chat is not None else []
+    if extra:
+        lines += [""] + extra
+    return "\n".join(lines)
 
 
 def keyboard(st):
@@ -96,12 +122,16 @@ def keyboard(st):
                 for k, l in DEVICES
             ],
             [
-                {"text": on(st["s"] == n, f"⏱ {n} dtk"), "callback_data": enc("set", {**st, "s": n})}
-                for n in SECS
+                {"text": on(st["a"] == 1, "🔊 Dengan suara"), "callback_data": enc("set", {**st, "a": 1})},
+                {"text": on(st["a"] == 0, "🔇 Tanpa suara"), "callback_data": enc("set", {**st, "a": 0})},
             ],
             [
                 {"text": on(st["t"] == 1, "👆 Tap otomatis"), "callback_data": enc("set", {**st, "t": 1})},
                 {"text": on(st["t"] == 0, "📜 Scroll saja"), "callback_data": enc("set", {**st, "t": 0})},
+            ],
+            [
+                {"text": on(st["p"] == k, l), "callback_data": enc("set", {**st, "p": k})}
+                for k, l in PACES
             ],
             [{"text": "▶️ Mulai rekam", "callback_data": enc("go", st)}],
             [
@@ -128,7 +158,7 @@ def send_panel(chat, url, st):
     return tg(
         "sendMessage",
         chat_id=chat,
-        text=panel_text(url, st),
+        text=panel_text(url, st, chat),
         reply_markup=keyboard(st),
         link_preview_options={"is_disabled": True},
     )
@@ -163,31 +193,50 @@ def run_job(job):
     env.update(
         REC_URL=url,
         REC_DEVICE=st["d"],
-        REC_SECONDS=str(st["s"]),
+        REC_AUDIO=str(st["a"]),
         REC_TAP=str(st["t"]),
+        REC_PACE=st["p"],
+        REC_MAX_SECONDS=str(MAX_REC),
+        REC_RULES=json.dumps(rules_of(chat)),
     )
     p = subprocess.run(
         [sys.executable, "record.py"],
         env=env,
         capture_output=True,
         text=True,
-        timeout=st["s"] + 180,
+        timeout=MAX_REC + 240,
     )
     mp4 = os.path.join("out", "rec.mp4")
     if p.returncode != 0 or not os.path.exists(mp4):
         tail = ((p.stderr or "") + (p.stdout or "")).strip()[-300:]
         raise RuntimeError(tail or "rekaman gagal")
+
+    out = p.stdout or ""
+
+    def field(name):
+        m = re.search(rf"\| {name}: ([^|]*)", out)
+        return m.group(1).strip() if m else "-"
+
+    suara = {
+        "ok": "🔊 ada suara",
+        "hening": "🔇 hening (web tidak mengeluarkan suara)",
+        "off": "tanpa suara",
+        "tidak-ada": "🔇 audio gagal ditangkap",
+    }.get(field("suara"), "-")
     note = ""
-    m = re.search(r"\| error: (.*)$", p.stdout or "", re.M)
+    m = re.search(r"\| error: (.*)$", out, re.M)
     if m and m.group(1).strip() != "None":
         note = f"\n⚠️ Ada masalah saat membuka halaman: {m.group(1).strip()[:150]}"
-    caption = f"Rekaman: {url}\n{DEV_NAME[st['d']]}, {st['s']} dtk{note}"[:1000]
+    caption = (
+        f"Rekaman: {url}\n{DEV_NAME[st['d']]}, {field('durasi')} dtk, {suara}\n"
+        f"Berhenti karena: {field('alasan')}{note}"
+    )[:1000]
     with open(mp4, "rb") as f:
         r = requests.post(
             f"{API}/sendVideo",
             data={"chat_id": chat, "caption": caption, "supports_streaming": "true"},
             files={"video": f},
-            timeout=240,
+            timeout=300,
         ).json()
     if not r.get("ok"):
         raise RuntimeError("gagal kirim video: " + str(r.get("description")))
@@ -220,6 +269,38 @@ def worker():
             state["current"] = None
 
 
+def split_words(s):
+    return [x.strip() for x in re.split(r"[,\n]", s) if x.strip()][:12]
+
+
+def on_rule_command(chat, text):
+    m = re.match(r"^/(klik|hindari|selesai|aturan|hapusaturan)(?:@\w+)?\s*(.*)$", text, re.S)
+    if not m:
+        return None
+    cmd, arg = m.group(1), m.group(2).strip()
+    r = rules_of(chat)
+    if cmd == "hapusaturan":
+        RULES[str(chat)] = {"klik": [], "hindari": [], "selesai": ""}
+        return tg("sendMessage", chat_id=chat, text="Aturan dihapus ✅")
+    if cmd == "aturan" or not arg:
+        lines = rules_text(chat) or ["Belum ada aturan. Bot menekan semua tombol yang terdeteksi."]
+        lines += [
+            "",
+            "/klik teks1, teks2  → tekan tombol ini duluan (sesuai urutan)",
+            "/hindari teks1, teks2  → jangan tekan tombol ini",
+            "/selesai teks  → berhenti saat teks ini muncul di layar",
+            "/hapusaturan  → kosongkan semua",
+        ]
+        return tg("sendMessage", chat_id=chat, text="\n".join(lines))
+    if cmd == "klik":
+        r["klik"] = split_words(arg)
+    elif cmd == "hindari":
+        r["hindari"] = split_words(arg)
+    else:
+        r["selesai"] = arg[:60]
+    return tg("sendMessage", chat_id=chat, text="Tersimpan ✅\n\n" + "\n".join(rules_text(chat)))
+
+
 def on_message(m):
     chat = m["chat"]["id"]
     uid = m["from"]["id"]
@@ -232,15 +313,23 @@ def on_message(m):
             chat_id=chat,
             text=f"Akses ditolak. ID kamu: {uid}\nIsi secret CHAT_ID dengan ID ini.",
         )
+    if text.startswith("/"):
+        done = on_rule_command(chat, text)
+        if done is not None:
+            return done
     url = find_url(text)
     if url:
         reply = (m.get("reply_to_message") or {}).get("text") or ""
-        hint = re.search(r"\((pc|iphone|ipad)\|(\d+)\|([01])\)", reply)
+        hint = re.search(r"\((pc|hp|iphone|ipad)\|([01])\|([01])\|([fns])\)", reply)
         st = dec("x|" + "|".join(hint.groups()))[1] if hint else dict(DEFAULT)
         return send_panel(chat, url, st)
     if re.match(r"^/(start|panel|menu)\b", text):
         return send_panel(chat, None, dict(DEFAULT))
-    return tg("sendMessage", chat_id=chat, text="Kirim link web (https://...) atau ketik /panel.")
+    return tg(
+        "sendMessage",
+        chat_id=chat,
+        text="Kirim link web (https://...) atau ketik /panel. Ketik /aturan untuk atur tombol yang ditekan.",
+    )
 
 
 def on_callback(q):
@@ -260,13 +349,13 @@ def on_callback(q):
 
     if act == "set":
         answer()
-        return edit(chat, mid, panel_text(url, st), keyboard(st))
+        return edit(chat, mid, panel_text(url, st, chat), keyboard(st))
     if act == "lk":
         answer()
         return tg(
             "sendMessage",
             chat_id=chat,
-            text=f"Balas pesan ini dengan link web.\n({st['d']}|{st['s']}|{st['t']})",
+            text=f"Balas pesan ini dengan link web.\n({st['d']}|{st['a']}|{st['t']}|{st['p']})",
             reply_markup={"force_reply": True, "input_field_placeholder": "https://..."},
         )
     if act == "st":
@@ -283,7 +372,8 @@ def on_callback(q):
         return edit(
             chat,
             mid,
-            f"{head}\n\nLink: {url}\nPerangkat: {DEV_NAME[st['d']]}\nVideo dikirim ke chat ini, sekitar 1-2 menit.",
+            f"{head}\n\nLink: {url}\nPerangkat: {DEV_NAME[st['d']]}\n"
+            "Rekaman berhenti sendiri saat web selesai, video dikirim ke chat ini.",
             after_markup(st),
         )
     return answer()
@@ -321,7 +411,7 @@ def main():
                 handle(u)
             except Exception as e:
                 print("handle error:", type(e).__name__, str(e)[:200], flush=True)
-    grace = time.time() + 600
+    grace = time.time() + 900
     while (state["current"] or not jobs.empty()) and time.time() < grace:
         time.sleep(5)
     print("selesai, menunggu restart", flush=True)
